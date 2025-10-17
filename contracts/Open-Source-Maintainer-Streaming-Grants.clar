@@ -6,6 +6,10 @@
 (define-constant ERR_INVALID_AMOUNT (err u1004))
 (define-constant ERR_NO_USAGE_METRICS (err u1005))
 
+
+(define-constant ERR_MILESTONE_NOT_MET (err u1006))
+(define-constant ERR_INVALID_MILESTONE (err u1007))
+
 (define-map maintainers principal {
   project-name: (string-ascii 64),
   total-grants: uint,
@@ -199,4 +203,100 @@
 
 (define-read-only (get-grant-counter)
   (var-get grant-counter)
+)
+
+
+(define-map vesting-grants uint {
+  funder: principal,
+  maintainer: principal,
+  project-name: (string-ascii 64),
+  total-amount: uint,
+  remaining-amount: uint,
+  milestone-stars: (list 5 uint),
+  milestone-percentages: (list 5 uint),
+  milestones-unlocked: uint,
+  is-active: bool
+})
+
+(define-data-var vesting-counter uint u0)
+
+(define-read-only (get-vesting-grant (grant-id uint))
+  (map-get? vesting-grants grant-id)
+)
+
+(define-read-only (check-milestone-eligibility (grant-id uint) (milestone-index uint))
+  (match (map-get? vesting-grants grant-id)
+    grant (match (map-get? project-usage (get project-name grant))
+      metrics (let ((required-stars (default-to u0 (element-at (get milestone-stars grant) milestone-index)))
+                    (current-stars (get stars metrics)))
+                (ok (>= current-stars required-stars))
+              )
+      (ok false)
+    )
+    (ok false)
+  )
+)
+
+(define-public (create-vesting-grant 
+  (maintainer principal) 
+  (project-name (string-ascii 64))
+  (total-amount uint)
+  (milestone-stars (list 5 uint))
+  (milestone-percentages (list 5 uint)))
+  
+  (let ((vesting-id (+ (var-get vesting-counter) u1)))
+    (asserts! (> total-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (is-eq (len milestone-stars) (len milestone-percentages)) ERR_INVALID_MILESTONE)
+    (asserts! (is-some (map-get? maintainers maintainer)) ERR_NOT_FOUND)
+    
+    (try! (stx-transfer? total-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set vesting-grants vesting-id {
+      funder: tx-sender,
+      maintainer: maintainer,
+      project-name: project-name,
+      total-amount: total-amount,
+      remaining-amount: total-amount,
+      milestone-stars: milestone-stars,
+      milestone-percentages: milestone-percentages,
+      milestones-unlocked: u0,
+      is-active: true
+    })
+    
+    (var-set vesting-counter vesting-id)
+    (ok vesting-id)
+  )
+)
+
+(define-public (unlock-milestone (grant-id uint))
+  (let ((grant (unwrap! (map-get? vesting-grants grant-id) ERR_NOT_FOUND)))
+    (asserts! (is-eq tx-sender (get maintainer grant)) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-active grant) ERR_NOT_FOUND)
+    
+    (let ((next-milestone (get milestones-unlocked grant))
+          (metrics (unwrap! (map-get? project-usage (get project-name grant)) ERR_NO_USAGE_METRICS)))
+      
+      (asserts! (< next-milestone (len (get milestone-stars grant))) ERR_INVALID_MILESTONE)
+      
+      (let ((required-stars (unwrap! (element-at (get milestone-stars grant) next-milestone) ERR_INVALID_MILESTONE))
+            (payout-percent (unwrap! (element-at (get milestone-percentages grant) next-milestone) ERR_INVALID_MILESTONE)))
+        
+        (asserts! (>= (get stars metrics) required-stars) ERR_MILESTONE_NOT_MET)
+        
+        (let ((payout-amount (/ (* (get total-amount grant) payout-percent) u100)))
+          (try! (as-contract (stx-transfer? payout-amount tx-sender (get maintainer grant))))
+          
+          (let ((new-remaining (- (get remaining-amount grant) payout-amount))
+                (new-unlocked (+ next-milestone u1)))
+            (map-set vesting-grants grant-id (merge grant {
+              remaining-amount: new-remaining,
+              milestones-unlocked: new-unlocked,
+              is-active: (not (is-eq new-remaining u0))
+            }))
+            (ok payout-amount)
+          )
+        )
+      )
+    )
+  )
 )
