@@ -6,9 +6,13 @@
 (define-constant ERR_INVALID_AMOUNT (err u1004))
 (define-constant ERR_NO_USAGE_METRICS (err u1005))
 
-
 (define-constant ERR_MILESTONE_NOT_MET (err u1006))
 (define-constant ERR_INVALID_MILESTONE (err u1007))
+
+(define-constant ERR_GRANT_STILL_ACTIVE (err u1008))
+(define-constant ERR_REFUND_NOT_ELIGIBLE (err u1009))
+(define-constant ERR_REFUND_ALREADY_PROCESSED (err u1010))
+(define-constant REFUND_COOLDOWN_BLOCKS u4320)
 
 (define-map maintainers principal {
   project-name: (string-ascii 64),
@@ -296,6 +300,63 @@
             (ok payout-amount)
           )
         )
+      )
+    )
+  )
+)
+
+(define-map grant-refunds uint {
+  requested-at: uint,
+  processed: bool
+})
+
+(define-read-only (get-refund-status (grant-id uint))
+  (map-get? grant-refunds grant-id)
+)
+
+(define-read-only (is-refund-eligible (grant-id uint))
+  (match (map-get? streaming-grants grant-id)
+    grant (let ((blocks-since-last (- stacks-block-height (get last-claim grant))))
+            (and 
+              (not (get is-active grant))
+              (>= blocks-since-last REFUND_COOLDOWN_BLOCKS)
+              (> (get remaining-funds grant) u0)
+            )
+          )
+    false
+  )
+)
+
+(define-public (request-grant-refund (grant-id uint))
+  (let ((grant (unwrap! (map-get? streaming-grants grant-id) ERR_NOT_FOUND)))
+    (asserts! (is-eq tx-sender (get funder grant)) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get is-active grant)) ERR_GRANT_STILL_ACTIVE)
+    (asserts! (is-none (map-get? grant-refunds grant-id)) ERR_REFUND_ALREADY_PROCESSED)
+    
+    (let ((blocks-since-last (- stacks-block-height (get last-claim grant))))
+      (asserts! (>= blocks-since-last REFUND_COOLDOWN_BLOCKS) ERR_REFUND_NOT_ELIGIBLE)
+      (asserts! (> (get remaining-funds grant) u0) ERR_INVALID_AMOUNT)
+      
+      (let ((refund-amount (get remaining-funds grant)))
+        (try! (as-contract (stx-transfer? refund-amount tx-sender (get funder grant))))
+        
+        (map-set streaming-grants grant-id (merge grant {
+          remaining-funds: u0
+        }))
+        
+        (map-set grant-refunds grant-id {
+          requested-at: stacks-block-height,
+          processed: true
+        })
+        
+        (match (map-get? funders tx-sender)
+          funder-data (map-set funders tx-sender (merge funder-data {
+            active-streams: (- (get active-streams funder-data) u1)
+          }))
+          true
+        )
+        
+        (ok refund-amount)
       )
     )
   )
